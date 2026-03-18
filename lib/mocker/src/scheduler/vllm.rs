@@ -308,11 +308,15 @@ async fn simulate_prefill(
     args: &MockEngineArgs,
 ) -> Duration {
     let start_time = Instant::now();
-    let mut total_time = Duration::ZERO;
 
     let mut token_budget = args
         .max_num_batched_tokens
         .map_or(usize::MAX, |t| t.saturating_sub(state.decode.len()));
+
+    // Accumulate batch-level prefill stats for a single predict call after the loop
+    let mut batch_count: usize = 0;
+    let mut batch_total_isl: usize = 0;
+    let mut batch_total_prefix: usize = 0;
 
     'prefill: while token_budget > 0 {
         // Drain prefill first, then pull from waiting one at a time
@@ -374,13 +378,13 @@ async fn simulate_prefill(
             seq.commit_allocation(cumulative);
         }
 
-        // Accumulate prefill compute time (only for the new tokens in this chunk)
+        // Accumulate per-request (isl, prefix) for batch-level prediction
         let new_tokens_in_chunk = chunk.min(remaining);
         if args.worker_type != WorkerType::Decode && new_tokens_in_chunk > 0 {
-            total_time += Duration::from_secs_f64(
-                prefill_cost.predict_prefill_compute(Some(new_tokens_in_chunk), &args.perf_model)
-                    / 1000.0,
-            );
+            let isl = prefill_cost.cached_tokens + new_tokens_in_chunk;
+            batch_total_isl += isl;
+            batch_total_prefix += prefill_cost.cached_tokens;
+            batch_count += 1;
         }
 
         // Hit rate: fraction of tokens that were already cached
@@ -403,6 +407,18 @@ async fn simulate_prefill(
         }
     }
 
+    // One batch-level prefill prediction instead of summing per-request predictions
+    let total_time = if batch_count > 0 {
+        let mean_isl = batch_total_isl / batch_count;
+        let mean_prefix = batch_total_prefix / batch_count;
+        let ms = args
+            .perf_model
+            .predict_prefill_time(batch_count, mean_isl, mean_prefix);
+        Duration::from_secs_f64(ms / 1000.0)
+    } else {
+        Duration::ZERO
+    };
+
     if args.speedup_ratio > 0.0 && total_time > Duration::ZERO {
         let sleep_duration = Duration::from_secs_f64(total_time.as_secs_f64() / args.speedup_ratio);
         let deadline = start_time + sleep_duration;
@@ -423,9 +439,6 @@ async fn simulate_decode(
 ) -> Duration {
     let start_time = Instant::now();
 
-    // Compute decode timing
-    let active_kv_tokens = kv_manager.num_active_blocks() * args.block_size;
-
     // Compute average context length across all active decode requests
     let total_length: usize = state
         .decode
@@ -439,11 +452,13 @@ async fn simulate_decode(
         })
         .sum();
     let count = state.decode.len();
-
     let context_length = if count > 0 { total_length / count } else { 0 };
-    let decoding_time = args
-        .perf_model
-        .predict_decode_time(active_kv_tokens, context_length);
+
+    let active_kv_tokens = kv_manager.num_active_blocks() * args.block_size;
+    let decoding_time =
+        args.perf_model
+            .predict_decode_time(count, active_kv_tokens, context_length);
+
     let total_time = Duration::from_secs_f64(decoding_time / 1000.0);
 
     // Process decoding
