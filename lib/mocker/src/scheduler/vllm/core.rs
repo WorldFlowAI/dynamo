@@ -949,6 +949,7 @@ impl VllmCore {
                 .as_ref()
                 .map(CapturedRouterEventBuffer::drain)
                 .unwrap_or_default(),
+            semantic_events: Vec::new(),
             fpm: Some(fpm),
             accept_length_output_tokens,
             accept_length_decode_forwards,

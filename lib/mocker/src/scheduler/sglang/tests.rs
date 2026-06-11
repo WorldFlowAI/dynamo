@@ -1999,4 +1999,68 @@ mod semantic_reuse {
             "blended prefill ({blended:.3} ms) must beat cold prefill ({cold:.3} ms)"
         );
     }
+
+    #[test]
+    fn semantic_events_announce_generation_and_registered_donors() {
+        use dynamo_kv_router::semantic_events::{
+            SEMANTIC_KV_EVENT_SCHEMA_VERSION, SemanticKvEventData, sequence_digest,
+        };
+
+        let donor_tokens: Vec<u32> = (0..128u32).collect();
+        let run = |semantic: bool| -> Vec<dynamo_kv_router::semantic_events::SemanticKvEvent> {
+            let mut args = test_args(64, BLOCK_SIZE, 8192);
+            if semantic {
+                let mut sem = semantic_cfg(HashMap::new());
+                sem.provider_generation = 7;
+                args.semantic_sim = Some(sem);
+            }
+            let mut core = SglangCore::new(args);
+            core.receive(super::direct_request(donor_tokens.clone(), 1));
+            let mut events = Vec::new();
+            let mut now_ms = 0.0;
+            for _ in 0..8 {
+                if core.is_empty() {
+                    break;
+                }
+                let pass = core.execute_hidden_pass(now_ms);
+                now_ms = pass.end_ms;
+                events.extend(pass.semantic_events);
+            }
+            assert!(core.is_empty());
+            events
+        };
+
+        assert!(run(false).is_empty(), "disabled engines emit nothing");
+
+        let events = run(true);
+        assert_eq!(events.len(), 2);
+        for (expected_id, event) in events.iter().enumerate() {
+            assert_eq!(event.schema_version, SEMANTIC_KV_EVENT_SCHEMA_VERSION);
+            assert_eq!(event.event_id, expected_id as u64);
+            assert_eq!(event.dp_rank, 0);
+        }
+        assert_eq!(
+            events[0].data,
+            SemanticKvEventData::ProviderGenerationReset { generation: 7 }
+        );
+        let SemanticKvEventData::DonorRegistered(registered) = &events[1].data else {
+            panic!("expected DonorRegistered, got {:?}", events[1].data);
+        };
+        assert_eq!(registered.token_count, donor_tokens.len() as u32);
+        assert_eq!(registered.provider_generation, 7);
+        // Mock engine registers the completed request as one whole-sequence
+        // segment spanning the prompt.
+        assert_eq!(registered.segments.len(), 1);
+        let seg = &registered.segments[0];
+        assert_eq!(seg.segment_id, 0);
+        assert_eq!(seg.token_range, (0, donor_tokens.len() as u32));
+        let expected: Vec<u64> = donor_tokens.iter().map(|&t| u64::from(t)).collect();
+        assert_eq!(seg.digest, sequence_digest(&expected));
+        assert!(seg.block_hashes.is_none());
+        // Location is the emitting worker's device tier.
+        assert!(matches!(
+            registered.location,
+            dynamo_kv_router::semantic_events::DonorLocation::Worker { dp_rank: 0, .. }
+        ));
+    }
 }

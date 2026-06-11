@@ -153,6 +153,12 @@ pub(crate) struct EnginePassResult {
     pub(crate) router_event_visibility: RouterEventVisibility,
     /// Router-visible KV events emitted during this pass.
     pub(crate) kv_events: Vec<RouterEvent>,
+    /// Semantic donor lifecycle events emitted during this pass. Empty unless
+    /// blended-reuse simulation is enabled on an SGLang-personality engine.
+    /// Read by scheduler tests today; the replay-harness bridge that forwards
+    /// these to external consumers is the next increment.
+    #[allow(dead_code)]
+    pub(crate) semantic_events: Vec<dynamo_kv_router::semantic_events::SemanticKvEvent>,
     /// Forward pass metrics snapshot for this iteration.
     pub(crate) fpm: Option<ForwardPassSnapshot>,
     /// Visible output tokens emitted by this pass for accept-length accounting.

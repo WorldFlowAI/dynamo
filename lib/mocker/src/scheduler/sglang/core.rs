@@ -21,6 +21,25 @@ use crate::scheduler::{
     CapturedRouterEventBuffer, EnginePassResult, MockerMetrics, RouterEventVisibility,
     accept_length_sample, build_fpm_snapshot, capture_router_event_sink,
 };
+use dynamo_kv_router::protocols::StorageTier;
+use dynamo_kv_router::semantic_events::{
+    CacheNamespace, DonorLocation, DonorRegistered, DonorSegment, SEMANTIC_KV_EVENT_SCHEMA_VERSION,
+    SemanticKvEvent, SemanticKvEventData, sequence_digest,
+};
+
+/// Namespace placeholder for the mock engine; real emitters construct this from
+/// model, tokenizer, adapter, and KV-layout identity.
+fn mocker_namespace(block_size: u32) -> CacheNamespace {
+    CacheNamespace {
+        model: "mocker-sglang".to_string(),
+        tokenizer: "mocker".to_string(),
+        kv_layout: "mocker".to_string(),
+        block_size,
+        lora: None,
+        quant: None,
+        extra: std::collections::BTreeMap::new(),
+    }
+}
 
 pub(crate) struct SglangCore {
     pub(super) config: SglangConfig,
@@ -35,6 +54,11 @@ pub(crate) struct SglangCore {
     /// resolve blended reuse plans. Only populated when semantic simulation
     /// is enabled.
     donor_registry: HashMap<Uuid, Vec<u64>>,
+    worker_id: WorkerId,
+    /// Pending semantic donor lifecycle events, drained into each pass result.
+    semantic_event_log: Vec<SemanticKvEvent>,
+    /// Monotonic id for this worker's semantic event stream.
+    next_semantic_event_id: u64,
 }
 
 impl SglangCore {
@@ -82,7 +106,7 @@ impl SglangCore {
             SpeculativeDecodeSampler::new(rates, args.aic_mtp_seed.wrapping_add(worker_id))
         });
 
-        Self {
+        let mut core = Self {
             config,
             dp_rank,
             waiting: VecDeque::new(),
@@ -97,7 +121,28 @@ impl SglangCore {
             speculative_sampler,
             kv_event_buffer,
             donor_registry: HashMap::new(),
+            worker_id,
+            semantic_event_log: Vec::new(),
+            next_semantic_event_id: 0,
+        };
+        // Announce the active generation as the stream head so consumers
+        // start from a known reset point.
+        if let Some(generation) = core.config.semantic.as_ref().map(|s| s.provider_generation) {
+            core.emit_semantic_event(SemanticKvEventData::ProviderGenerationReset { generation });
         }
+        core
+    }
+
+    fn emit_semantic_event(&mut self, data: SemanticKvEventData) {
+        let event = SemanticKvEvent {
+            schema_version: SEMANTIC_KV_EVENT_SCHEMA_VERSION,
+            event_id: self.next_semantic_event_id,
+            worker_id: self.worker_id,
+            dp_rank: self.dp_rank,
+            data,
+        };
+        self.next_semantic_event_id += 1;
+        self.semantic_event_log.push(event);
     }
 
     pub(crate) fn receive(&mut self, request: DirectRequest) -> Uuid {
@@ -202,15 +247,42 @@ impl SglangCore {
             simulate_prefill_duration(batch_size, mean_isl, mean_prefix, &self.config, true)
         };
 
-        let semantic_enabled = self.config.semantic.is_some();
+        let semantic_generation = self.config.semantic.as_ref().map(|s| s.provider_generation);
         for mut req in admit.can_run {
             if req.materialized_tokens < req.current_sequence_len() {
                 cache_materialized_prefix(&mut req, &mut self.kv_manager, &self.config);
                 self.waiting.push_front(req);
             } else {
-                if semantic_enabled {
-                    self.donor_registry
-                        .insert(req.uuid, req.prompt_tokens.clone());
+                if let Some(generation) = semantic_generation
+                    && self
+                        .donor_registry
+                        .insert(req.uuid, req.prompt_tokens.clone())
+                        .is_none()
+                {
+                    let token_count = req.prompt_tokens.len() as u32;
+                    // The mock engine registers a completed request as one
+                    // whole-sequence segment; real providers segment further.
+                    let segment = DonorSegment {
+                        segment_id: 0,
+                        token_range: (0, token_count),
+                        digest: sequence_digest(&req.prompt_tokens),
+                        block_hashes: None,
+                        provider_metadata: None,
+                    };
+                    self.emit_semantic_event(SemanticKvEventData::DonorRegistered(
+                        DonorRegistered {
+                            donor_id: req.uuid,
+                            namespace: mocker_namespace(self.config.block_size as u32),
+                            location: DonorLocation::Worker {
+                                worker_id: self.worker_id,
+                                dp_rank: self.dp_rank,
+                                tier: StorageTier::Device,
+                            },
+                            token_count,
+                            segments: vec![segment],
+                            provider_generation: generation,
+                        },
+                    ));
                 }
                 self.running.push(req);
             }
@@ -307,6 +379,7 @@ impl SglangCore {
                 .as_ref()
                 .map(CapturedRouterEventBuffer::drain)
                 .unwrap_or_default(),
+            semantic_events: std::mem::take(&mut self.semantic_event_log),
             fpm: Some(fpm),
             accept_length_output_tokens,
             accept_length_decode_forwards,

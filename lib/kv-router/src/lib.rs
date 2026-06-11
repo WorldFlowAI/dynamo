@@ -13,6 +13,7 @@ pub mod indexer;
 pub mod protocols;
 pub mod recovery;
 pub mod scheduling;
+pub mod semantic_events;
 pub mod sequences;
 pub mod services;
 pub mod zmq_wire;
