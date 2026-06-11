@@ -38,6 +38,7 @@ These systems provide enhanced scheduling capabilities including topology-aware 
 - Multi-level horizontal auto-scaling
 - Custom startup ordering for components
 - Resource-aware rolling updates
+- [Topology Aware Scheduling](../topology-aware-scheduling.md) — pack pods within a rack, block, or other topology domain for lower latency
 
 
 [KAI-Scheduler](https://github.com/NVIDIA/KAI-Scheduler) is a Kubernetes native scheduler optimized for AI workloads at large scale.
@@ -64,7 +65,7 @@ KAI-Scheduler is optional but recommended for advanced scheduling capabilities.
 LWS is a simple multinode deployment mechanism that allows you to deploy a workload across multiple nodes.
 
 - **LWS**: [LWS Installation](https://github.com/kubernetes-sigs/lws#installation)
-- **Volcano**: [Volcano Installation](https://volcano.sh/en/docs/installation/)
+- **Volcano**: [Volcano Installation](https://github.com/volcano-sh/volcano#quick-start-guide)
 
 Volcano is a Kubernetes native scheduler optimized for AI workloads at scale. It is used in conjunction with LWS to provide gang scheduling support.
 
